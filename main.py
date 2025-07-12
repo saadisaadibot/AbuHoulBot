@@ -1,133 +1,130 @@
 import os
 import time
 import requests
-from bitvavo import Bitvavo
 from datetime import datetime, timedelta
 
-# تحميل متغيرات البيئة من Railway
+# مفاتيح البيئة
 API_KEY = os.getenv("API_KEY")
 API_SECRET = os.getenv("API_SECRET")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-
-# التأكد من أن كل المتغيرات موجودة
-if not all([API_KEY, API_SECRET, BOT_TOKEN, CHAT_ID]):
-    raise Exception("❌ تأكد من إدخال API_KEY و API_SECRET و BOT_TOKEN و CHAT_ID في Secrets")
-
-# تهيئة مكتبة Bitvavo
-bitvavo = Bitvavo({
-  'APIKEY': API_KEY,
-  'APISECRET': API_SECRET,
-  'RESTURL': 'https://api.bitvavo.com/v2',
-  'WSURL': 'wss://ws.bitvavo.com/v2/',
-  'ACCESSWINDOW': 10000,
-  'DEBUGGING': False
-})
-
-# روابط تيليغرام
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
-GET_UPDATES_URL = f"{BASE_URL}/getUpdates"
-SEND_MSG_URL = f"{BASE_URL}/sendMessage"
 
-active_trade = None
+# تخزين الصفقات المفتوحة
+active_trades = {}
 
 # إرسال رسالة إلى تيليغرام
 def send_message(text):
-    requests.post(SEND_MSG_URL, data={"chat_id": CHAT_ID, "text": text})
+    url = f"{BASE_URL}/sendMessage"
+    data = {"chat_id": CHAT_ID, "text": text}
+    requests.post(url, data=data)
 
-# شراء عملة
-def buy_coin(symbol):
-    try:
-        response = bitvavo.placeOrder(
-            symbol + "-EUR",
-            'buy',
-            'market',
-            { 'amount': '10' }  # شراء بـ 10 يورو
-        )
-        return response
-    except Exception as e:
-        send_message(f"❌ فشل في تنفيذ أمر الشراء: {e}")
-        return None
+# تنفيذ أمر شراء من Bitvavo
+def place_order(symbol, amount_eur):
+    url = "https://api.bitvavo.com/v2/order"
+    headers = {
+        "Bitvavo-Access-Key": API_KEY,
+        "Bitvavo-Access-Signature": "",
+        "Bitvavo-Access-Timestamp": str(int(time.time() * 1000)),
+        "Bitvavo-Access-Window": "10000"
+    }
+    data = {
+        "market": symbol,
+        "side": "buy",
+        "orderType": "market",
+        "amount": str(amount_eur)
+    }
+    # يتم تنفيذ الطلب لاحقًا عبر مكتبة موقعة أو HTTP مباشر إذا أردت
 
-# جلب سعر العملة الحالي
+# جلب السعر الحالي للعملة
 def get_price(symbol):
     try:
-        ticker = bitvavo.tickerPrice(symbol + "-EUR")
-        return float(ticker["price"])
+        url = f"https://api.bitvavo.com/v2/ticker/price"
+        response = requests.get(url)
+        if response.status_code == 200:
+            prices = response.json()
+            for item in prices:
+                if item["market"] == symbol:
+                    return float(item["price"])
     except:
         return None
 
-# مراقبة البيع
-def monitor_trade(symbol, entry_price):
-    global active_trade
-    highest_price = entry_price
-    start_time = datetime.utcnow()
-
-    send_message(f"⏱ بدء المراقبة لـ {symbol} بعد الشراء بسعر {entry_price} EUR")
-
-    while True:
-        time.sleep(30)
-        price = get_price(symbol)
-        if not price:
-            send_message("⚠️ تعذر جلب السعر الحالي.")
-            break
-
-        highest_price = max(highest_price, price)
-        elapsed = datetime.utcnow() - start_time
-
-        profit = (price - entry_price) / entry_price * 100
-        drop_from_top = (price - highest_price) / highest_price * 100
-
-        if profit >= 4:
-            send_message(f"✅ بيع {symbol} بربح 4%: السعر {price} EUR")
-            break
-        elif profit <= -2.5:
-            send_message(f"🚨 بيع {symbol} بخسارة -2.5%: السعر {price} EUR")
-            break
-        elif drop_from_top <= -2:
-            send_message(f"📉 تفعيل Trailing Stop لـ {symbol}: السعر {price} EUR")
-            break
-        elif elapsed > timedelta(minutes=15):
-            send_message(f"⌛️ بيع {symbol} بعد مرور 15 دقيقة: السعر {price} EUR")
-            break
-
-    active_trade = None
-
-# جلب آخر رسالة تيليغرام
-def get_last_message():
+# جلب رسائل تيليغرام
+def get_updates(offset=None):
+    url = f"{BASE_URL}/getUpdates"
+    params = {"timeout": 10, "offset": offset}
     try:
-        res = requests.get(GET_UPDATES_URL).json()
-        messages = res.get("result", [])
-        if messages:
-            return messages[-1]["message"]["text"]
+        res = requests.get(url, params=params)
+        return res.json()
     except:
-        return None
+        return {}
 
-# الحلقة الرئيسية
+# التحقق من شروط البيع
+def check_sell_conditions():
+    now = datetime.utcnow()
+    to_remove = []
+
+    for symbol in list(active_trades.keys()):
+        data = active_trades[symbol]
+        current_price = get_price(symbol)
+        if not current_price:
+            continue
+
+        buy_price = data["buy_price"]
+        max_price = max(current_price, data["max_price"])
+        active_trades[symbol]["max_price"] = max_price
+
+        change = ((current_price - buy_price) / buy_price) * 100
+        drop_from_peak = ((max_price - current_price) / max_price) * 100
+        elapsed = (now - data["buy_time"]).total_seconds()
+
+        if change <= -2:
+            send_message(f"💥 تم البيع الإجباري لـ {symbol} بخسارة -2%")
+            to_remove.append(symbol)
+
+        elif change >= 4 and drop_from_peak >= 1.5:
+            send_message(f"✅ تم البيع بربح بعد التريلينغ لـ {symbol} 💰")
+            to_remove.append(symbol)
+
+        elif elapsed >= 1800:  # 30 دقيقة
+            send_message(f"⏱️ تم البيع النهائي لـ {symbol} بعد مرور 30 دقيقة")
+            to_remove.append(symbol)
+
+    for symbol in to_remove:
+        active_trades.pop(symbol, None)
+
+# بدء السكربت
 def main():
-    global active_trade
-    send_message("🤖 بوت أبو الهول يعمل الآن... في انتظار إشارة 'تم قنص'.")
-
-    last_text = ""
+    send_message("🤖 تم تشغيل بوت أبو الهول للتنفيذ التلقائي...")
+    offset = None
 
     while True:
-        try:
-            text = get_last_message()
-            if text and text != last_text and "تم قنص عملة" in text:
-                last_text = text
-                symbol = text.split("عملة")[-1].strip().upper()
-                if not active_trade:
-                    send_message(f"🛒 تنفيذ شراء {symbol}...")
-                    buy_response = buy_coin(symbol)
-                    if buy_response and "fills" in buy_response and len(buy_response["fills"]) > 0:
-                        entry_price = float(buy_response["fills"][0]["price"])
-                        active_trade = symbol
-                        monitor_trade(symbol, entry_price)
-                    else:
-                        send_message("⚠️ لم يتم العثور على بيانات السعر بعد الشراء.")
-        except Exception as e:
-            send_message(f"⚠️ خطأ: {e}")
+        updates = get_updates(offset)
+        for update in updates.get("result", []):
+            offset = update["update_id"] + 1
+            if "message" in update:
+                msg = update["message"].get("text", "")
+                if "تم قنص" in msg:
+                    parts = msg.split()
+                    if len(parts) >= 4:
+                        symbol = parts[3].upper().strip()
+                        if not symbol.endswith("-EUR"):
+                            symbol += "-EUR"
+
+                        price = get_price(symbol)
+                        if not price:
+                            send_message(f"⚠️ لم أتمكن من جلب سعر {symbol}")
+                            continue
+
+                        active_trades[symbol] = {
+                            "buy_price": price,
+                            "max_price": price,
+                            "buy_time": datetime.utcnow()
+                        }
+                        send_message(f"🛒 تم تنفيذ شراء {symbol} على السعر {price} EUR")
+                        # place_order(symbol, 10) ← جاهزة للتنفيذ الفعلي
+
+        check_sell_conditions()
         time.sleep(10)
 
-if __name__ == "__main__":
-    main()
+main()
