@@ -2,64 +2,74 @@ import os
 import time
 import requests
 from datetime import datetime, timedelta
+from bitvavo import Bitvavo
 
-# مفاتيح البيئة
-API_KEY = os.getenv("API_KEY")
-API_SECRET = os.getenv("API_SECRET")
+# إعداد Bitvavo
+bitvavo = Bitvavo({
+    'APIKEY': os.getenv("API_KEY"),
+    'APISECRET': os.getenv("API_SECRET"),
+    'RESTURL': 'https://api.bitvavo.com/v2',
+    'WSURL': 'wss://ws.bitvavo.com/v2/',
+    'ACCESSWINDOW': 10000
+})
+
+# إعدادات تيليغرام
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# تخزين الصفقات المفتوحة
+# صفقات نشطة
 active_trades = {}
 
 # إرسال رسالة إلى تيليغرام
 def send_message(text):
-    url = f"{BASE_URL}/sendMessage"
-    data = {"chat_id": CHAT_ID, "text": text}
-    requests.post(url, data=data)
+    try:
+        url = f"{BASE_URL}/sendMessage"
+        data = {"chat_id": CHAT_ID, "text": text}
+        requests.post(url, data=data)
+    except:
+        pass
 
-# تنفيذ أمر شراء من Bitvavo
-def place_order(symbol, amount_eur):
-    url = "https://api.bitvavo.com/v2/order"
-    headers = {
-        "Bitvavo-Access-Key": API_KEY,
-        "Bitvavo-Access-Signature": "",
-        "Bitvavo-Access-Timestamp": str(int(time.time() * 1000)),
-        "Bitvavo-Access-Window": "10000"
-    }
-    data = {
-        "market": symbol,
-        "side": "buy",
-        "orderType": "market",
-        "amount": str(amount_eur)
-    }
-    # يتم تنفيذ الطلب لاحقًا عبر مكتبة موقعة أو HTTP مباشر إذا أردت
+# شراء مباشر بـ 10 يورو
+def place_buy(symbol):
+    try:
+        order = bitvavo.placeOrder(symbol, {
+            'market': symbol,
+            'side': 'buy',
+            'orderType': 'market',
+            'amount': '10',
+            'paymentCurrency': 'EUR'
+        })
+        return float(order['fills'][0]['price']) if 'fills' in order and order['fills'] else None
+    except Exception as e:
+        send_message(f"⚠️ خطأ أثناء الشراء: {e}")
+        return None
 
-# جلب السعر الحالي للعملة
+# بيع مباشر كل الكمية
+def place_sell(symbol):
+    try:
+        balance = bitvavo.balance(symbol.replace("-EUR", "").upper())
+        available = float(balance[0]['available'])
+        if available > 0:
+            bitvavo.placeOrder(symbol, {
+                'market': symbol,
+                'side': 'sell',
+                'orderType': 'market',
+                'amount': str(available)
+            })
+            send_message(f"💰 تم البيع الكامل لـ {symbol} بنجاح.")
+    except Exception as e:
+        send_message(f"⚠️ خطأ أثناء البيع: {e}")
+
+# جلب السعر الحالي
 def get_price(symbol):
     try:
-        url = f"https://api.bitvavo.com/v2/ticker/price"
-        response = requests.get(url)
-        if response.status_code == 200:
-            prices = response.json()
-            for item in prices:
-                if item["market"] == symbol:
-                    return float(item["price"])
+        res = bitvavo.tickerPrice({'market': symbol})
+        return float(res['price'])
     except:
         return None
 
-# جلب رسائل تيليغرام
-def get_updates(offset=None):
-    url = f"{BASE_URL}/getUpdates"
-    params = {"timeout": 10, "offset": offset}
-    try:
-        res = requests.get(url, params=params)
-        return res.json()
-    except:
-        return {}
-
-# التحقق من شروط البيع
+# تحديث الصفقات ومراقبة البيع
 def check_sell_conditions():
     now = datetime.utcnow()
     to_remove = []
@@ -79,23 +89,36 @@ def check_sell_conditions():
         elapsed = (now - data["buy_time"]).total_seconds()
 
         if change <= -2:
-            send_message(f"💥 تم البيع الإجباري لـ {symbol} بخسارة -2%")
+            place_sell(symbol)
+            send_message(f"❌ بيع بخسارة -2%: {symbol}")
             to_remove.append(symbol)
 
         elif change >= 4 and drop_from_peak >= 1.5:
-            send_message(f"✅ تم البيع بربح بعد التريلينغ لـ {symbol} 💰")
+            place_sell(symbol)
+            send_message(f"✅ بيع بربح بعد تريلينغ: {symbol}")
             to_remove.append(symbol)
 
-        elif elapsed >= 1800:  # 30 دقيقة
-            send_message(f"⏱️ تم البيع النهائي لـ {symbol} بعد مرور 30 دقيقة")
+        elif elapsed >= 1800:
+            place_sell(symbol)
+            send_message(f"⏱️ بيع تلقائي بعد 30 دقيقة: {symbol}")
             to_remove.append(symbol)
 
     for symbol in to_remove:
         active_trades.pop(symbol, None)
 
-# بدء السكربت
+# جلب تحديثات تيليغرام
+def get_updates(offset=None):
+    try:
+        url = f"{BASE_URL}/getUpdates"
+        params = {"timeout": 10, "offset": offset}
+        response = requests.get(url, params=params)
+        return response.json()
+    except:
+        return {}
+
+# تشغيل البوت
 def main():
-    send_message("🤖 تم تشغيل بوت أبو الهول للتنفيذ التلقائي...")
+    send_message("🤖 تم تشغيل أبو الهول للتنفيذ التلقائي على Bitvavo.")
     offset = None
 
     while True:
@@ -111,18 +134,14 @@ def main():
                         if not symbol.endswith("-EUR"):
                             symbol += "-EUR"
 
-                        price = get_price(symbol)
-                        if not price:
-                            send_message(f"⚠️ لم أتمكن من جلب سعر {symbol}")
-                            continue
-
-                        active_trades[symbol] = {
-                            "buy_price": price,
-                            "max_price": price,
-                            "buy_time": datetime.utcnow()
-                        }
-                        send_message(f"🛒 تم تنفيذ شراء {symbol} على السعر {price} EUR")
-                        # place_order(symbol, 10) ← جاهزة للتنفيذ الفعلي
+                        buy_price = place_buy(symbol)
+                        if buy_price:
+                            active_trades[symbol] = {
+                                "buy_price": buy_price,
+                                "max_price": buy_price,
+                                "buy_time": datetime.utcnow()
+                            }
+                            send_message(f"🛒 تم شراء {symbol} على السعر {buy_price} EUR ✅")
 
         check_sell_conditions()
         time.sleep(10)
