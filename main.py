@@ -1,149 +1,179 @@
 import os
 import time
 import requests
-from datetime import datetime, timedelta
-from bitvavo import Bitvavo
+import redis
+import json
 
-# إعداد Bitvavo
-bitvavo = Bitvavo({
-    'APIKEY': os.getenv("API_KEY"),
-    'APISECRET': os.getenv("API_SECRET"),
-    'RESTURL': 'https://api.bitvavo.com/v2',
-    'WSURL': 'wss://ws.bitvavo.com/v2/',
-    'ACCESSWINDOW': 10000
-})
+redis_url = os.getenv("REDIS_URL")
+r = redis.from_url(redis_url, decode_responses=True)
 
-# إعدادات تيليغرام
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 BASE_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-# صفقات نشطة
-active_trades = {}
-
-# إرسال رسالة إلى تيليغرام
 def send_message(text):
-    try:
-        url = f"{BASE_URL}/sendMessage"
-        data = {"chat_id": CHAT_ID, "text": text}
-        requests.post(url, data=data)
-    except:
-        pass
+    requests.post(f"{BASE_URL}/sendMessage", data={"chat_id": CHAT_ID, "text": text})
 
-# شراء مباشر بـ 10 يورو
-def place_buy(symbol):
+def fetch_price(symbol):
     try:
-        order = bitvavo.placeOrder(symbol, {
-            'market': symbol,
-            'side': 'buy',
-            'orderType': 'market',
-            'amount': '10',
-            'paymentCurrency': 'EUR'
-        })
-        return float(order['fills'][0]['price']) if 'fills' in order and order['fills'] else None
-    except Exception as e:
-        send_message(f"⚠️ خطأ أثناء الشراء: {e}")
-        return None
-
-# بيع مباشر كل الكمية
-def place_sell(symbol):
-    try:
-        balance = bitvavo.balance(symbol.replace("-EUR", "").upper())
-        available = float(balance[0]['available'])
-        if available > 0:
-            bitvavo.placeOrder(symbol, {
-                'market': symbol,
-                'side': 'sell',
-                'orderType': 'market',
-                'amount': str(available)
-            })
-            send_message(f"💰 تم البيع الكامل لـ {symbol} بنجاح.")
-    except Exception as e:
-        send_message(f"⚠️ خطأ أثناء البيع: {e}")
-
-# جلب السعر الحالي
-def get_price(symbol):
-    try:
-        res = bitvavo.tickerPrice({'market': symbol})
-        return float(res['price'])
+        url = f"https://api.bitvavo.com/v2/ticker/price?market={symbol}"
+        response = requests.get(url)
+        if response.status_code == 200:
+            return float(response.json()["price"])
     except:
         return None
 
-# تحديث الصفقات ومراقبة البيع
-def check_sell_conditions():
-    now = datetime.utcnow()
-    to_remove = []
+def delete_memory():
+    db.clear()
+    send_message("🧹 تم مسح ذاكرة أبو الهول بالكامل.")
 
-    for symbol in list(active_trades.keys()):
-        data = active_trades[symbol]
-        current_price = get_price(symbol)
-        if not current_price:
+def check_prices():
+    for symbol in list(db.keys()):
+        if symbol == "sell_log":
             continue
 
-        buy_price = data["buy_price"]
-        max_price = max(current_price, data["max_price"])
-        active_trades[symbol]["max_price"] = max_price
+        entry = db[symbol]
+        current = fetch_price(symbol)
+        if not current:
+            continue
 
-        change = ((current_price - buy_price) / buy_price) * 100
-        drop_from_peak = ((max_price - current_price) / max_price) * 100
-        elapsed = (now - data["buy_time"]).total_seconds()
+        entry_price = entry["entry"]
 
-        if change <= -2:
-            place_sell(symbol)
-            send_message(f"❌ بيع بخسارة -2%: {symbol}")
-            to_remove.append(symbol)
+        if entry.get("status") == "trailing":
+            peak = entry["peak"]
+            if current > peak:
+                entry["peak"] = current
+                db[symbol] = entry
 
-        elif change >= 4 and drop_from_peak >= 1.5:
-            place_sell(symbol)
-            send_message(f"✅ بيع بربح بعد تريلينغ: {symbol}")
-            to_remove.append(symbol)
+            drop = ((peak - current) / peak) * 100
+            if drop >= 1.5:
+                change = ((current - entry_price) / entry_price) * 100
+                send_message(f"🎯 {symbol} تم البيع بعد ارتفاع ثم نزول – ربح {round(change,2)}%")
+                log = db.get("sell_log", [])
+                log.append({
+                    "symbol": symbol,
+                    "entry": entry_price,
+                    "exit": current,
+                    "change": round(change,2),
+                    "result": "ربح"
+                })
+                db["sell_log"] = log
+                del db[symbol]
+        else:
+            change = ((current - entry_price) / entry_price) * 100
+            if change >= 3:
+                entry["status"] = "trailing"
+                entry["peak"] = current
+                entry["start_time"] = time.time()
+                db[symbol] = entry
+                send_message(f"🟢 {symbol} ارتفعت +3% – نبدأ مراقبة القمة.")
+            elif change <= -3:
+                send_message(f"📉 {symbol} خسارة -{round(abs(change), 2)}% – تم البيع.")
+                log = db.get("sell_log", [])
+                log.append({
+                    "symbol": symbol,
+                    "entry": entry_price,
+                    "exit": current,
+                    "change": round(change,2),
+                    "result": "خسارة"
+                })
+                db["sell_log"] = log
+                del db[symbol]
 
-        elif elapsed >= 1800:
-            place_sell(symbol)
-            send_message(f"⏱️ بيع تلقائي بعد 30 دقيقة: {symbol}")
-            to_remove.append(symbol)
-
-    for symbol in to_remove:
-        active_trades.pop(symbol, None)
-
-# جلب تحديثات تيليغرام
 def get_updates(offset=None):
+    res = requests.get(f"{BASE_URL}/getUpdates", params={"offset": offset, "timeout": 10})
+    return res.json()
+
+def format_duration(minutes):
+    hours = minutes // 60
+    mins = minutes % 60
+    if hours > 0:
+        return f"{hours} ساعة و{mins} دقيقة"
+    else:
+        return f"{mins} دقيقة"
+
+def handle_command(text):
+    if "احذف" in text or "حذف" in text:
+        delete_memory()
+
+    elif "الملخص" in text or "الحسابات" in text:
+        log = db.get("sell_log", [])
+        if not log:
+            send_message("📊 لا توجد أي عمليات بيع مُسجلة بعد.")
+        else:
+            total_profit = 0
+            win_count = 0
+            lose_count = 0
+            for trade in log:
+                entry = trade["entry"]
+                exit_price = trade["exit"]
+                profit_percent = ((exit_price - entry) / entry) * 100
+                total_profit += profit_percent
+                if profit_percent >= 0:
+                    win_count += 1
+                else:
+                    lose_count += 1
+
+            msg = (
+                f"📈 عدد الصفقات الرابحة: {win_count}\n"
+                f"📉 عدد الصفقات الخاسرة: {lose_count}\n"
+                f"💰 صافي الربح/الخسارة: {round(total_profit, 2)}%\n"
+            )
+
+            # 👁️ العملات التي تتم مراقبتها الآن
+            watchlist = []
+            for key in db.keys():
+                if key == "sell_log":
+                    continue
+                entry = db[key]
+                duration_min = int((time.time() - entry["start_time"]) / 60)
+                watchlist.append(f"- {key} منذ {format_duration(duration_min)}")
+
+            if watchlist:
+                msg += "\n👁️ العملات التي تتم مراقبتها الآن:\n" + "\n".join(watchlist)
+
+            send_message(msg)
+
+def detect_snipe_messages(text):
+    if "تم قنص" in text:
+        parts = text.split()
+        for word in parts:
+            if "-EUR" in word and word not in db:
+                price = fetch_price(word)
+                if price:
+                    db[word] = {
+                        "entry": price,
+                        "status": None,
+                        "start_time": time.time()
+                    }
+                    send_message(f"🕵️‍♂️ أبو الهول يراقب {word} عند {price} EUR")
+
+# ========== النهاية المستقرة للتشغيل على Background ==========
+send_message("🤖 تم تشغيل أبو الهول بنسخة Background المستقرة.")
+offset = None
+last_cycle = time.time()
+
+while True:
     try:
-        url = f"{BASE_URL}/getUpdates"
-        params = {"timeout": 10, "offset": offset}
-        response = requests.get(url, params=params)
-        return response.json()
-    except:
-        return {}
-
-# تشغيل البوت
-def main():
-    send_message("🤖 تم تشغيل أبو الهول للتنفيذ التلقائي على Bitvavo.")
-    offset = None
-
-    while True:
         updates = get_updates(offset)
         for update in updates.get("result", []):
             offset = update["update_id"] + 1
-            if "message" in update:
-                msg = update["message"].get("text", "")
-                if "تم قنص" in msg:
-                    parts = msg.split()
-                    if len(parts) >= 4:
-                        symbol = parts[3].upper().strip()
-                        if not symbol.endswith("-EUR"):
-                            symbol += "-EUR"
 
-                        buy_price = place_buy(symbol)
-                        if buy_price:
-                            active_trades[symbol] = {
-                                "buy_price": buy_price,
-                                "max_price": buy_price,
-                                "buy_time": datetime.utcnow()
-                            }
-                            send_message(f"🛒 تم شراء {symbol} على السعر {buy_price} EUR ✅")
+            # ✅ دعم كل أنواع الرسائل (شخص أو بوت)
+            msg = update.get("message") or update.get("edited_message")
+            if not msg:
+                continue
 
-        check_sell_conditions()
+            text = msg.get("text") or msg.get("caption") or ""
+            if not text:
+                continue
+
+            handle_command(text)
+            detect_snipe_messages(text)
+
+        check_prices()
+        time.sleep(5)
+
+    except Exception as e:
+        print(f"❌ خطأ: {e}")
         time.sleep(10)
-
-main()
