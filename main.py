@@ -164,6 +164,10 @@ while True:
             text = msg.get("text") or msg.get("caption") or ""
             if not text:
                 continue
+                # رد تلقائي على "مين ملك التريكس"
+if "مين ملك التريكس" in text:
+    send_message("أبو عبدو 👑🌹🌹🌹")
+    continue
             handle_command(text)
             detect_snipe_messages(text)
 
